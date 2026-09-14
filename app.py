@@ -10,8 +10,8 @@ Telegram App-Builder Bot (نسخة Pydroid3 + اشتراك إجباري + أكو
 """
 
 import json, os, re, shutil, zipfile, asyncio, tempfile, subprocess, base64
-import urllib.request, urllib.error
 import random, string, time
+from google import genai
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.error import Forbidden, BadRequest
 from telegram.ext import (Application, CommandHandler, MessageHandler, filters,
@@ -20,7 +20,7 @@ from telegram.ext import (Application, CommandHandler, MessageHandler, filters,
 # ===== قيمك =====
 # تحذير أمني: متسيبش المفاتيح دي مكتوبة صريحة في الكود لو هتشارك السكريبت مع
 # حد أو ترفعه على GitHub. الأفضل تستخدم متغيرات بيئة (os.environ).
-AI_SELVA_API_KEY = "AQ.Ab8RN6K7jj3TUqsU4Wwny-HPfZoL8t3BjN0j8rMeym9fsgQG0A"
+AI_SELVA_API_KEY = "AQ.Ab8RN6K_OXL-4oy04nHlPvDsYXlm6TAT3XR69Ba_gxIyYcYewA"
 TELEGRAM_TOKEN = "8830996414:AAFA1bD-QNTWAQPkxxBvMEMxmP8CzTLTiIE"
 # =================
 
@@ -37,8 +37,6 @@ DURATIONS = {
 
 DB_USERS = "users_db.json"
 DB_CODES = "codes_db.json"
-
-API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"
 
 MAX_FILES = 18  # سقف لعدد الملفات عشان ميطلعش تطبيق ضخم يتاخر أو يكلف كتير
 
@@ -275,42 +273,84 @@ async def my_codes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------- AI Selva calls ----------------
+# نستخدم مكتبة google-genai الرسمية بدل urllib اليدوي: المكتبة دي بتتحدّث مع
+# أي تغييرات في مصادقة جوجل (زي التحول لمفاتيح AQ.)، وده أضمن من إننا نبني
+# الطلبات بإيدينا ونتفاجئ بتغييرات جوهرية زي دي.
+_ai_client = genai.Client(api_key=AI_SELVA_API_KEY)
+_AI_MODEL = "gemini-3.6-flash"
 
-def _call_ai_selva(prompt_text: str, max_output_tokens: int) -> dict:
-    """يبعت طلب لـ AI Selva ويرجّع (candidate content text)، مع إعادة محاولة
-    وفحص finishReason عشان نمسك التقطيع بدري."""
-    body = json.dumps({
-        "contents": [{"parts": [{"text": prompt_text}]}],
-        "generationConfig": {
-            "response_mime_type": "application/json",
-            "maxOutputTokens": max_output_tokens,
-        },
-    }).encode()
-    req = urllib.request.Request(
-        API_URL,
-        data=body,
-        headers={"Content-Type": "application/json", "X-goog-api-key": AI_SELVA_API_KEY},
-        method="POST")
 
+def _extract_text(interaction) -> str:
+    """يحاول يطلع النص من رد الـ Interactions API بأكتر من طريقة، لأن شكل
+    الرد بيختلف حسب نسخة السيرفر/المكتبة."""
+    text = getattr(interaction, "output_text", None)
+    if text:
+        return text
+
+    for attr_name in ("steps", "outputs"):
+        items = getattr(interaction, attr_name, None)
+        if not items:
+            continue
+        last = items[-1]
+        content = getattr(last, "content", None)
+        if content is None and isinstance(last, dict):
+            content = last.get("content")
+        if isinstance(content, list) and content:
+            piece = content[0]
+            piece_text = getattr(piece, "text", None)
+            if piece_text is None and isinstance(piece, dict):
+                piece_text = piece.get("text")
+            if piece_text:
+                return piece_text
+        elif isinstance(content, str) and content:
+            return content
+        last_text = getattr(last, "text", None)
+        if last_text is None and isinstance(last, dict):
+            last_text = last.get("text")
+        if last_text:
+            return last_text
+    return ""
+
+
+def _call_ai_selva(prompt_text: str, max_output_tokens: int) -> str:
+    """يبعت طلب لـ AI Selva ويرجّع النص الخام، مع إعادة محاولة واحترام
+    حدود الكوتا، وفحص التقطيع (truncation) عشان نمسكه بدري."""
     last_err = ""
     for attempt in range(5):
         try:
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                data = json.loads(resp.read().decode())
-            candidate = data["candidates"][0]
-            finish_reason = candidate.get("finishReason", "")
-            if finish_reason == "MAX_TOKENS":
+            interaction = _ai_client.interactions.create(
+                model=_AI_MODEL,
+                input=prompt_text,
+                response_format={"type": "text", "mime_type": "application/json"},
+                generation_config={
+                    "max_output_tokens": max_output_tokens,
+                    # thinking_level منخفض عشان نسيب مساحة أكبر من ميزانية
+                    # التوكنز للمحتوى الفعلي بدل "التفكير الداخلي"
+                    "thinking_level": "low",
+                },
+            )
+
+            status = str(getattr(interaction, "status", "") or "").lower()
+            if status in ("incomplete", "max_tokens", "length"):
                 raise RuntimeError("TRUNCATED")
-            return candidate["content"]["parts"][0]["text"]
-        except urllib.error.HTTPError as e:
-            try:
-                detail = e.read().decode()[:800]
-            except Exception:
-                detail = ""
-            last_err = f"HTTP {e.code}: {detail}"
-            if e.code == 429:
-                # جوجل بترجع "Please retry in X.Xs." — نستنى بالمدة الفعلية دي
-                m = re.search(r"retry in ([\d.]+)s", detail)
+
+            text = _extract_text(interaction)
+            if not text:
+                raise RuntimeError("رد فاضي من AI Selva. جرّب تاني.")
+            return text
+
+        except RuntimeError as e:
+            if str(e) == "TRUNCATED":
+                raise
+            last_err = str(e)
+            time.sleep(3)
+
+        except Exception as e:
+            msg = str(e)
+            low = msg.lower()
+
+            if "429" in msg or "resource_exhausted" in low or "quota" in low:
+                m = re.search(r"retry in ([\d.]+)s", msg)
                 wait = float(m.group(1)) + 2 if m else 20
                 wait = min(wait, 60)
                 if attempt < 4:
@@ -320,18 +360,19 @@ def _call_ai_selva(prompt_text: str, max_output_tokens: int) -> dict:
                             "ده حد من جوجل نفسها (الباقة المجانية)، لازم تنتظر أو تفعّل "
                             "billing على المفتاح من https://ai.dev/rate-limit")
                 break
-            if e.code in (500, 502, 503, 504):
+
+            if "401" in msg or "unauthenticated" in low or "unauthorized" in low:
+                last_err = ("مفتاح الـ API غير صالح أو مرفوض (401). تأكد إنك نسخته "
+                            "صح بالكامل من https://aistudio.google.com/apikey وإنه "
+                            "مفعّل على المشروع الصحيح.")
+                break
+
+            if any(code in msg for code in ("500", "502", "503", "504")):
                 time.sleep(5 * (attempt + 1))
                 continue
-            break
-        except RuntimeError as e:
-            if str(e) == "TRUNCATED":
-                raise
-            last_err = str(e)
-            time.sleep(5)
-        except Exception as e:
-            last_err = str(e)
-            time.sleep(5)
+
+            last_err = msg
+            time.sleep(3)
 
     raise RuntimeError(last_err)
 
