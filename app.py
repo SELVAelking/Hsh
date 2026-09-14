@@ -3,7 +3,7 @@
 """
 Telegram App-Builder Bot (نسخة Pydroid3 + اشتراك إجباري + أكواد)
 -- نسخة v2: بنبني التطبيق على مرحلتين:
-   1) نطلب من Gemini خطة مختصرة + قائمة الملفات المطلوبة (رد صغير جدًا).
+   1) نطلب من AI Selva خطة مختصرة + قائمة الملفات المطلوبة (رد صغير جدًا).
    2) نطلب محتوى كل ملف على حدة (base64) في نداء مستقل.
    كل رد بقى صغير ومركّز، وده بيمنع مشكلة "الرد اتقطع" اللي كانت بتحصل
    لما نطلب كل التطبيق في رد واحد ضخم.
@@ -13,13 +13,14 @@ import json, os, re, shutil, zipfile, asyncio, tempfile, subprocess, base64
 import urllib.request, urllib.error
 import random, string, time
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.error import Forbidden, BadRequest
 from telegram.ext import (Application, CommandHandler, MessageHandler, filters,
                           ContextTypes, ConversationHandler)
 
 # ===== قيمك =====
 # تحذير أمني: متسيبش المفاتيح دي مكتوبة صريحة في الكود لو هتشارك السكريبت مع
 # حد أو ترفعه على GitHub. الأفضل تستخدم متغيرات بيئة (os.environ).
-GEMINI_API_KEY = "AQ.Ab8RN6K7jj3TUqsU4Wwny-HPfZoL8t3BjN0j8rMeym9fsgQG0A"
+AI_SELVA_API_KEY = "AQ.Ab8RN6K7jj3TUqsU4Wwny-HPfZoL8t3BjN0j8rMeym9fsgQG0A"
 TELEGRAM_TOKEN = "8830996414:AAFA1bD-QNTWAQPkxxBvMEMxmP8CzTLTiIE"
 # =================
 
@@ -70,7 +71,7 @@ Return ONLY a raw JSON object (no markdown fences, no commentary), in this exact
 The file content must be base64-encoded (standard base64, no line breaks in the encoded string),
 complete, and consistent with the other files in the list and the architecture plan.{extra_instruction}"""
 
-# نبني عدة ملفات في نداء واحد عشان نقلل عدد الطلبات لـ Gemini (مهم جدًا مع
+# نبني عدة ملفات في نداء واحد عشان نقلل عدد الطلبات لـ AI Selva (مهم جدًا مع
 # حدود الكوتا المحدودة في الباقة المجانية).
 BATCH_SIZE = 3
 
@@ -107,6 +108,23 @@ def load_json(path, default):
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+async def safe_edit(msg, text):
+    """يحاول يعدّل الرسالة، وبيبتلع أخطاء Forbidden (المستخدم عمل بلوك للبوت)
+    و BadRequest (زي الرسالة طويلة جدًا أو مفيش تغيير) بدل ما يوقّع البوت."""
+    try:
+        await msg.edit_text(text[:4090])
+    except (Forbidden, BadRequest):
+        pass
+    except Exception:
+        pass
+
+
+async def error_handler(update, ctx: ContextTypes.DEFAULT_TYPE):
+    """معالج أخطاء عام: يمنع الـ traceback الضخم من الظهور في اللوج لكل
+    استثناء غير متوقع، ويكتب سطر مختصر بدله."""
+    print(f"⚠️ Unhandled error: {ctx.error!r}")
 
 
 users_db = load_json(DB_USERS, {})
@@ -168,6 +186,8 @@ def redeem_code(user_id, text):
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
     uid = update.effective_user.id
     expired, remaining = subscription_status(uid)
     chans = "\n".join(f"• {c}" for c in CHANNELS)
@@ -190,7 +210,7 @@ DUR, USES = 1, 2
 
 
 async def code_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
     kb = [[d] for d in DURATIONS.keys()] + [["❌ إلغاء"]]
     await update.message.reply_text(
@@ -241,7 +261,7 @@ async def code_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def my_codes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
     if not codes_db:
         await update.message.reply_text("مفيش أكواد لسه. اكتب /code")
@@ -254,10 +274,10 @@ async def my_codes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("الأكواد:\n" + "\n".join(lines), parse_mode="HTML")
 
 
-# ---------------- Gemini calls ----------------
+# ---------------- AI Selva calls ----------------
 
-def _post_to_gemini(prompt_text: str, max_output_tokens: int) -> dict:
-    """يبعت طلب لـ Gemini ويرجّع (candidate content text)، مع إعادة محاولة
+def _call_ai_selva(prompt_text: str, max_output_tokens: int) -> dict:
+    """يبعت طلب لـ AI Selva ويرجّع (candidate content text)، مع إعادة محاولة
     وفحص finishReason عشان نمسك التقطيع بدري."""
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt_text}]}],
@@ -269,7 +289,7 @@ def _post_to_gemini(prompt_text: str, max_output_tokens: int) -> dict:
     req = urllib.request.Request(
         API_URL,
         data=body,
-        headers={"Content-Type": "application/json", "X-goog-api-key": GEMINI_API_KEY},
+        headers={"Content-Type": "application/json", "X-goog-api-key": AI_SELVA_API_KEY},
         method="POST")
 
     last_err = ""
@@ -296,7 +316,9 @@ def _post_to_gemini(prompt_text: str, max_output_tokens: int) -> dict:
                 if attempt < 4:
                     time.sleep(wait)
                     continue
-                last_err = ("تجاوزت الحد المسموح من api حاول بكرا")
+                last_err = ("تجاوزت الحد المسموح (Quota) لمفتاح AI Selva الحالي. "
+                            "ده حد من جوجل نفسها (الباقة المجانية)، لازم تنتظر أو تفعّل "
+                            "billing على المفتاح من https://ai.dev/rate-limit")
                 break
             if e.code in (500, 502, 503, 504):
                 time.sleep(5 * (attempt + 1))
@@ -315,7 +337,7 @@ def _post_to_gemini(prompt_text: str, max_output_tokens: int) -> dict:
 
 
 def _parse_json_relaxed(text: str) -> dict:
-    """يحاول يفكّ رد Gemini كـ JSON، مع تنظيف أي fences أو نص زيادة حواليه."""
+    """يحاول يفكّ رد AI Selva كـ JSON، مع تنظيف أي fences أو نص زيادة حواليه."""
     cleaned = text.strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
     cleaned = re.sub(r"\s*```$", "", cleaned).strip()
@@ -331,11 +353,11 @@ def _parse_json_relaxed(text: str) -> dict:
 def get_app_plan(idea: str) -> dict:
     """المرحلة 1: خطة مختصرة + قائمة الملفات فقط (رد صغير، بعيد عن التقطيع)."""
     prompt = PLAN_PROMPT.format(idea=idea, max_files=MAX_FILES)
-    raw = _post_to_gemini(prompt, max_output_tokens=4096)
+    raw = _call_ai_selva(prompt, max_output_tokens=4096)
     plan = _parse_json_relaxed(raw)
     files = plan.get("files", [])
     if not files:
-        raise ValueError("Gemini مرجّعش قائمة ملفات. جرّب تاني.")
+        raise ValueError("AI Selva مرجّعش قائمة ملفات. جرّب تاني.")
     if len(files) > MAX_FILES:
         files = files[:MAX_FILES]
     plan["files"] = files
@@ -350,7 +372,7 @@ def get_file_content(idea: str, description: str, file_list, path: str,
         file_list=", ".join(file_list), path=path,
         extra_instruction=extra_instruction,
     )
-    raw = _post_to_gemini(prompt, max_output_tokens=24576)
+    raw = _call_ai_selva(prompt, max_output_tokens=24576)
     data = _parse_json_relaxed(raw)
     b64 = data.get("content_base64", "")
     try:
@@ -362,14 +384,14 @@ def get_file_content(idea: str, description: str, file_list, path: str,
 def get_files_batch(idea: str, description: str, file_list, batch_paths,
                      extra_instruction: str = "") -> dict:
     """المرحلة 2 (نسخة batch): يبني عدة ملفات في نداء واحد لتقليل عدد الطلبات
-    لـ Gemini (مفيد جدًا مع حدود الكوتا). يرجّع dict {path: content}."""
+    لـ AI Selva (مفيد جدًا مع حدود الكوتا). يرجّع dict {path: content}."""
     prompt = BATCH_FILE_PROMPT.format(
         idea=idea, description=description,
         file_list=", ".join(file_list),
         paths_list="\n".join(f"- {p}" for p in batch_paths),
         extra_instruction=extra_instruction,
     )
-    raw = _post_to_gemini(prompt, max_output_tokens=24576)
+    raw = _call_ai_selva(prompt, max_output_tokens=24576)
     data = _parse_json_relaxed(raw)
     files_b64 = data.get("files", {})
     result = {}
@@ -387,29 +409,41 @@ def get_files_batch(idea: str, description: str, file_list, batch_paths,
 # ---------------- Bot flow ----------------
 
 async def build_app(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return  # تحديثات بدون مستخدم/رسالة (مثل بوستات القنوات) - نتجاهلها
+
     uid = update.effective_user.id
     text = update.message.text
 
     if uid != ADMIN_ID:
         if not await is_member(ctx.bot, uid):
             chans = "\n".join(f"• {c}" for c in CHANNELS)
-            await update.message.reply_text(
-                f"⚠️ لازم تشترك في القنوات دي الأول:\n{chans}\n\n"
-                "بعد الاشتراك ابعت رسالتك تاني.")
+            try:
+                await update.message.reply_text(
+                    f"⚠️ لازم تشترك في القنوات دي الأول:\n{chans}\n\n"
+                    "بعد الاشتراك ابعت رسالتك تاني.")
+            except (Forbidden, BadRequest):
+                pass
             return
 
         expired, remaining = subscription_status(uid)
         if expired:
             ok, res = redeem_code(uid, text)
-            if ok:
-                await update.message.reply_text(
-                    f"🎉 تم تفعيل اشتراكك!\n⏱ المدة المتاحة: {res}\n\nدلوقتي ابعت فكرة التطبيق.")
-            else:
-                await update.message.reply_text(
-                    f"⚠️ {res}\n\nاشترك في القنوات وبعدها ابعت كود الاشتراك هنا.")
+            try:
+                if ok:
+                    await update.message.reply_text(
+                        f"🎉 تم تفعيل اشتراكك!\n⏱ المدة المتاحة: {res}\n\nدلوقتي ابعت فكرة التطبيق.")
+                else:
+                    await update.message.reply_text(
+                        f"⚠️ {res}\n\nاشترك في القنوات وبعدها ابعت كود الاشتراك هنا.")
+            except (Forbidden, BadRequest):
+                pass
             return
 
-    msg = await update.message.reply_text("🤖 جاري التخطيط للتطبيق...")
+    try:
+        msg = await update.message.reply_text("🤖 جاري التخطيط للتطبيق...")
+    except (Forbidden, BadRequest):
+        return  # المستخدم عمل بلوك للبوت - مفيش داعي نكمل
 
     # المرحلة 1: خطة + قائمة ملفات
     try:
@@ -418,7 +452,7 @@ async def build_app(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         err = str(e)
         if err == "TRUNCATED":
             err = "الخطة نفسها اتقطعت! جرّب فكرة أقصر شوية."
-        await msg.edit_text(f"❌ خطأ في التخطيط:\n{err[:800]}")
+        await safe_edit(msg, f"❌ خطأ في التخطيط:\n{err[:800]}")
         return
 
     file_list = plan["files"]
@@ -430,18 +464,14 @@ async def build_app(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     appdir = os.path.join(workdir, appname)
     os.makedirs(appdir, exist_ok=True)
 
-    # نقسم قائمة الملفات لمجموعات (batches) عشان نقلل عدد الطلبات لـ Gemini
+    # نقسم قائمة الملفات لمجموعات (batches) عشان نقلل عدد الطلبات لـ AI Selva
     batches = [file_list[i:i + BATCH_SIZE] for i in range(0, len(file_list), BATCH_SIZE)]
     built_files = {}
     failed_files = []
 
     for bi, batch_paths in enumerate(batches, start=1):
         names_preview = "\n".join(f"📄 {p}" for p in batch_paths)
-        try:
-            await msg.edit_text(
-                f"🤖 بناء المجموعة {bi}/{len(batches)}:\n{names_preview}")
-        except Exception:
-            pass
+        await safe_edit(msg, f"🤖 بناء المجموعة {bi}/{len(batches)}:\n{names_preview}")
 
         batch_result = {}
         last_reason = ""
@@ -478,13 +508,13 @@ async def build_app(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             built_files[path] = content
 
     if not built_files:
-        await msg.edit_text("❌ فشل بناء كل الملفات. جرّب فكرة أبسط.")
+        await safe_edit(msg, "❌ فشل بناء كل الملفات. جرّب فكرة أبسط.")
         shutil.rmtree(workdir, ignore_errors=True)
         return
 
     for cmd in (["git", "init"], ["git", "add", "."],
                 ["git", "-c", "user.email=bot@builder.local", "-c", "user.name=AppBuilderBot",
-                 "commit", "-m", "Initial commit generated by Gemini"]):
+                 "commit", "-m", "Initial commit generated by AI Selva"]):
         try:
             await asyncio.to_thread(subprocess.run, cmd, cwd=appdir,
                                     capture_output=True, timeout=30)
@@ -502,14 +532,29 @@ async def build_app(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fail_str = ("\n\n⚠️ فشل بناء:\n" + "\n".join(f"❌ {p} — {r}" for p, r in failed_files)) if failed_files else ""
     _, remaining = subscription_status(uid)
     footer = f"\n⏱ المتبقي في اشتراكك: {fmt_remaining(remaining)}" if uid != ADMIN_ID else ""
-    await msg.edit_text(f"✅ تم! {len(built_files)} ملف:\n{file_list_str[:2800]}{fail_str}{footer}")
-    await update.message.reply_document(
-        document=open(zip_path, "rb"),
-        filename=f"{appname}.zip",
-        caption=f"🚀 مشروع «{appname}» جاهز.{footer}\n"
-                "بعد فك الضغط داخل مجلد المشروع:\n"
-                "git remote add origin <رابط_repo>\n"
-                "git push -u origin main")
+
+    header = f"✅ تم! {len(built_files)} ملف:\n"
+    # حد تليجرام لطول الرسالة 4096 حرف - بنسيب هامش أمان ونقص كل جزء بنسبة
+    budget = 3500
+    body = f"{header}{file_list_str}{fail_str}{footer}"
+    if len(body) > budget:
+        # نقص قائمة الملفات الأول، والفشل تاني، مع الحفاظ على الفوتر
+        remaining_budget = budget - len(header) - len(footer) - 50
+        fl = file_list_str[:max(remaining_budget, 200)]
+        fs = fail_str[:max(remaining_budget - len(fl), 0)]
+        body = f"{header}{fl}\n…(القائمة اتقصت){fs}{footer}"
+
+    await safe_edit(msg, body)
+    try:
+        await update.message.reply_document(
+            document=open(zip_path, "rb"),
+            filename=f"{appname}.zip",
+            caption=(f"🚀 مشروع «{appname}» جاهز.{footer}\n"
+                     "بعد فك الضغط داخل مجلد المشروع:\n"
+                     "git remote add origin <رابط_repo>\n"
+                     "git push -u origin main")[:1024])
+    except (Forbidden, BadRequest):
+        pass
     shutil.rmtree(workdir, ignore_errors=True)
 
 
@@ -531,6 +576,7 @@ def main():
     app.add_handler(conv)
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, build_app))
+    app.add_error_handler(error_handler)
     print("🤖 Bot is running... أرسل /start لبوتك في التليجرام")
     app.run_polling()
 
