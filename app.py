@@ -20,7 +20,7 @@ from telegram.ext import (Application, CommandHandler, MessageHandler, filters,
 # ===== قيمك =====
 # تحذير أمني: متسيبش المفاتيح دي مكتوبة صريحة في الكود لو هتشارك السكريبت مع
 # حد أو ترفعه على GitHub. الأفضل تستخدم متغيرات بيئة (os.environ).
-AI_SELVA_API_KEY = "AQ.Ab8RN6IHZFsmBkSzQXBeZ4IWdvHkLb7KIdK-MBiPHCqbXqtK5A"
+AI_SELVA_API_KEY = "AQ.Ab8RN6Jorel-mZycT6zhAX7LwJvRoE0vhoecJc6cS0S8qc8HdQ"
 TELEGRAM_TOKEN = "8830996414:AAFA1bD-QNTWAQPkxxBvMEMxmP8CzTLTiIE"
 # =================
 
